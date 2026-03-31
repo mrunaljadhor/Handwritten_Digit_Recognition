@@ -38,12 +38,26 @@ def build_and_train_model():
     test_acc = model.score(X_test, y_test)
     return model, test_acc
 
+def ensure_black_background(img):
+    """Ensure the image has a black background (white digit) matching MNIST."""
+    img_array = np.array(img)
+    # Calculate average pixel value of the borders (which are mostly background)
+    borders = np.concatenate([
+        img_array[0, :], img_array[-1, :],
+        img_array[:, 0], img_array[:, -1]
+    ])
+    
+    # If the background is light (white/grey), invert it
+    if np.mean(borders) > 127:
+        return ImageOps.invert(img)
+    return img
+
 def preprocess_uploaded_image(uploaded_file):
     """Convert uploaded image to model-ready input."""
     img = Image.open(uploaded_file)
     img = img.convert('L')
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-    img = ImageOps.invert(img)
+    img = ensure_black_background(img)
     img_array = np.array(img).astype(np.float64) / 255.0
     img_flat = img_array.reshape(1, -1)  # Flatten to (1, 784)
     return img_flat, img
@@ -56,7 +70,7 @@ def preprocess_canvas_data(canvas_data_url):
     img = Image.open(io.BytesIO(img_bytes))
     img = img.convert('L')
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-    img = ImageOps.invert(img)
+    img = ensure_black_background(img)
     img_array = np.array(img).astype(np.float64) / 255.0
     img_flat = img_array.reshape(1, -1)
     return img_flat, img
