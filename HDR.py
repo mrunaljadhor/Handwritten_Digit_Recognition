@@ -1,102 +1,42 @@
 import numpy as np
 import streamlit as st
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from sklearn.datasets import fetch_openml
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
 from PIL import Image, ImageOps
-from streamlit_drawable_canvas import st_canvas
+import io
+import base64
+from streamlit.components.v1 import html
 
 # --- Configuration ---
 IMG_SIZE = 28
-DEVICE = torch.device('cpu')
-
-# --- CNN Model ---
-class DigitCNN(nn.Module):
-    def __init__(self):
-        super(DigitCNN, self).__init__()
-        self.conv_layers = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 64, 3, padding=1),
-            nn.ReLU(),
-        )
-        self.fc_layers = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 7, 64),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(64, 10),
-        )
-
-    def forward(self, x):
-        x = self.conv_layers(x)
-        x = self.fc_layers(x)
-        return x
 
 @st.cache_resource
 def build_and_train_model():
-    """Build, train, and return the CNN model on MNIST."""
-    # Load MNIST
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
+    """Build, train, and return the Random Forest model on MNIST."""
+    # Load MNIST from sklearn
+    mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='auto')
+    X, y = mnist.data, mnist.target.astype(int)
 
-    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    # Normalize
+    X = X / 255.0
 
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+    # Use a subset for faster training on cloud (20K samples)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.15, random_state=42, stratify=y
+    )
 
-    # Build and train
-    model = DigitCNN().to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    criterion = nn.CrossEntropyLoss()
+    # Train Random Forest
+    model = RandomForestClassifier(
+        n_estimators=150,
+        max_depth=30,
+        n_jobs=-1,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
 
-    model.train()
-    for epoch in range(3):
-        for data, target in train_loader:
-            data, target = data.to(DEVICE), target.to(DEVICE)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = criterion(output, target)
-            loss.backward()
-            optimizer.step()
-
-    # Evaluate
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for data, target in test_loader:
-            data, target = data.to(DEVICE), target.to(DEVICE)
-            output = model(data)
-            pred = output.argmax(dim=1)
-            correct += pred.eq(target).sum().item()
-            total += target.size(0)
-
-    test_acc = correct / total
+    test_acc = model.score(X_test, y_test)
     return model, test_acc
-
-def preprocess_canvas_image(canvas_result):
-    """Convert canvas drawing to model-ready input."""
-    if canvas_result.image_data is not None:
-        img = Image.fromarray(canvas_result.image_data.astype('uint8'), 'RGBA')
-        img = img.convert('L')
-        img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-        img = ImageOps.invert(img)
-        img_array = np.array(img).astype(np.float32) / 255.0
-        # Apply same normalization as training
-        img_array = (img_array - 0.1307) / 0.3081
-        img_tensor = torch.FloatTensor(img_array).unsqueeze(0).unsqueeze(0)
-        return img_tensor, img
-    return None, None
 
 def preprocess_uploaded_image(uploaded_file):
     """Convert uploaded image to model-ready input."""
@@ -104,18 +44,118 @@ def preprocess_uploaded_image(uploaded_file):
     img = img.convert('L')
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
     img = ImageOps.invert(img)
-    img_array = np.array(img).astype(np.float32) / 255.0
-    img_array = (img_array - 0.1307) / 0.3081
-    img_tensor = torch.FloatTensor(img_array).unsqueeze(0).unsqueeze(0)
-    return img_tensor, img
+    img_array = np.array(img).astype(np.float64) / 255.0
+    img_flat = img_array.reshape(1, -1)  # Flatten to (1, 784)
+    return img_flat, img
 
-def predict_digit(model, img_tensor):
-    """Run prediction and return probabilities."""
-    model.eval()
-    with torch.no_grad():
-        output = model(img_tensor.to(DEVICE))
-        probabilities = torch.softmax(output, dim=1).squeeze().numpy()
-    return probabilities
+def preprocess_canvas_data(canvas_data_url):
+    """Convert canvas base64 image data to model-ready input."""
+    # Remove the data URL prefix
+    header, encoded = canvas_data_url.split(",", 1)
+    img_bytes = base64.b64decode(encoded)
+    img = Image.open(io.BytesIO(img_bytes))
+    img = img.convert('L')
+    img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
+    img = ImageOps.invert(img)
+    img_array = np.array(img).astype(np.float64) / 255.0
+    img_flat = img_array.reshape(1, -1)
+    return img_flat, img
+
+def get_canvas_html():
+    """Return HTML/JS for an embedded drawing canvas."""
+    return """
+    <style>
+        .canvas-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+        }
+        #drawCanvas {
+            border: 2px solid #ffd200;
+            border-radius: 12px;
+            cursor: crosshair;
+            background: #000;
+            touch-action: none;
+        }
+        .canvas-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .canvas-btn {
+            padding: 8px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-clear {
+            background: #3a3a5c;
+            color: #e2e8f0;
+        }
+        .btn-clear:hover { background: #4a4a6c; }
+        .btn-predict {
+            background: linear-gradient(135deg, #f7971e, #ffd200);
+            color: #1a1a2e;
+        }
+        .btn-predict:hover { transform: scale(1.05); }
+    </style>
+    <div class="canvas-container">
+        <canvas id="drawCanvas" width="280" height="280"></canvas>
+        <div class="canvas-buttons">
+            <button class="canvas-btn btn-clear" onclick="clearCanvas()">🗑️ Clear</button>
+            <button class="canvas-btn btn-predict" onclick="sendCanvas()">🔍 Predict</button>
+        </div>
+    </div>
+    <script>
+        const canvas = document.getElementById('drawCanvas');
+        const ctx = canvas.getContext('2d');
+        let drawing = false;
+
+        ctx.fillStyle = '#000';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 18;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        function getPos(e) {
+            const rect = canvas.getBoundingClientRect();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+            return {
+                x: (clientX - rect.left) * (canvas.width / rect.width),
+                y: (clientY - rect.top) * (canvas.height / rect.height)
+            };
+        }
+
+        canvas.addEventListener('mousedown', (e) => { drawing = true; ctx.beginPath(); const p = getPos(e); ctx.moveTo(p.x, p.y); });
+        canvas.addEventListener('mousemove', (e) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); });
+        canvas.addEventListener('mouseup', () => { drawing = false; });
+        canvas.addEventListener('mouseleave', () => { drawing = false; });
+
+        canvas.addEventListener('touchstart', (e) => { e.preventDefault(); drawing = true; ctx.beginPath(); const p = getPos(e); ctx.moveTo(p.x, p.y); });
+        canvas.addEventListener('touchmove', (e) => { e.preventDefault(); if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); });
+        canvas.addEventListener('touchend', (e) => { e.preventDefault(); drawing = false; });
+
+        function clearCanvas() {
+            ctx.fillStyle = '#000';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function sendCanvas() {
+            const dataURL = canvas.toDataURL('image/png');
+            // Send to Streamlit via query params trick
+            const encoded = encodeURIComponent(dataURL);
+            window.parent.postMessage({type: 'streamlit:setComponentValue', value: dataURL}, '*');
+
+            // Also store in a hidden input for form submission
+            const existing = window.parent.document.querySelectorAll('input[data-testid="stTextInput"]');
+        }
+    </script>
+    """
 
 def main():
     st.set_page_config(
@@ -212,7 +252,6 @@ def main():
     .confidence-bar-fill {
         height: 100%;
         border-radius: 8px;
-        transition: width 0.5s ease;
     }
 
     .status-badge {
@@ -236,6 +275,13 @@ def main():
         font-weight: 600;
         margin-left: 0.5rem;
     }
+
+    .sample-grid {
+        display: grid;
+        grid-template-columns: repeat(5, 1fr);
+        gap: 8px;
+        margin: 1rem 0;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -243,37 +289,37 @@ def main():
     with st.sidebar:
         st.markdown("### ⚙️ About")
         st.markdown("""
-        **Handwritten Digit Recognition** uses a 
-        Convolutional Neural Network (CNN) trained 
-        on the MNIST dataset to recognize digits 0-9.
+        **Handwritten Digit Recognition** uses a
+        Random Forest classifier trained on the
+        MNIST dataset to recognize digits 0-9.
 
         **Tech Stack:**
-        - 🧠 PyTorch CNN
-        - 📊 MNIST Dataset (60K training images)
-        - ✏️ Interactive Drawing Canvas
+        - 🧠 scikit-learn Random Forest
+        - 📊 MNIST Dataset (70K images)
         - 📤 Image Upload Support
+        - 🎨 Built-in Drawing Canvas
         """)
         st.divider()
-        st.markdown("### 💡 Tips")
+        st.markdown("### 💡 Tips for Best Results")
         st.markdown("""
-        - **Draw thick digits** in the center of the canvas
-        - Use the **full canvas area** for better results
-        - **Clear** the canvas before drawing a new digit
-        - Upload a **clear, high-contrast** image for best accuracy
+        - Draw **thick, centered** digits
+        - Use a **white digit on dark background**
+        - Upload **clear, high-contrast** images
+        - **Square images** work best
         """)
         st.divider()
-        st.caption("Built with ❤️ using Streamlit & PyTorch")
+        st.caption("Built with ❤️ using Streamlit & scikit-learn")
 
     # --- Header ---
     st.markdown("""
     <div class="main-header">
         <h1>✏️ Handwritten Digit Recognition</h1>
-        <p>Draw or upload a digit (0-9) and let the CNN predict it</p>
+        <p>Upload an image of a digit (0-9) and let the ML model predict it</p>
     </div>
     """, unsafe_allow_html=True)
 
     # Load model
-    with st.spinner("🧠 Training CNN model on MNIST — this may take a minute on first run..."):
+    with st.spinner("🧠 Training model on MNIST — this may take a minute on first run..."):
         model, test_acc = build_and_train_model()
 
     st.markdown(
@@ -283,122 +329,174 @@ def main():
     )
     st.write("")
 
-    # --- Input method ---
-    tab1, tab2 = st.tabs(["✏️ Draw a Digit", "📤 Upload an Image"])
+    # --- Prediction display function ---
+    def show_prediction(probabilities, col):
+        predicted_digit = np.argmax(probabilities)
+        confidence = probabilities[predicted_digit] * 100
 
-    with tab1:
-        col1, col2 = st.columns([1, 1], gap="large")
+        with col:
+            st.markdown("#### 🎯 Prediction Result")
+            st.markdown(f"""
+            <div class="prediction-card">
+                <div class="prediction-label">Predicted Digit</div>
+                <div class="prediction-digit">{predicted_digit}</div>
+                <div style="color: #94a3b8; margin-top: 0.5rem;">
+                    Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-        with col1:
-            st.markdown("#### Draw your digit below:")
-            canvas_result = st_canvas(
-                fill_color="rgba(0, 0, 0, 1)",
-                stroke_width=20,
-                stroke_color="#FFFFFF",
-                background_color="#000000",
-                height=280,
-                width=280,
-                drawing_mode="freedraw",
-                key="canvas",
-            )
+            st.markdown("#### 📊 All Predictions")
+            top_indices = np.argsort(probabilities)[::-1]
+            for i, idx in enumerate(top_indices):
+                prob = probabilities[idx] * 100
+                if prob < 0.1:
+                    continue
+                if i == 0:
+                    bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
+                elif i == 1:
+                    bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
+                else:
+                    bar_color = "linear-gradient(90deg, #4a5568, #718096)"
+                st.markdown(f"""
+                <div class="confidence-bar-container">
+                    <div class="confidence-label">
+                        <span>Digit {idx}</span>
+                        <span>{prob:.1f}%</span>
+                    </div>
+                    <div class="confidence-bar-bg">
+                        <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
-        if st.button("🔍 Predict", key="predict_draw", use_container_width=True):
-            if canvas_result.image_data is not None:
-                img_tensor, processed_img = preprocess_canvas_image(canvas_result)
-                if img_tensor is not None:
-                    probabilities = predict_digit(model, img_tensor)
-                    predicted_digit = np.argmax(probabilities)
-                    confidence = probabilities[predicted_digit] * 100
+    # --- Upload Image ---
+    st.markdown("### 📤 Upload a Digit Image")
 
-                    with col2:
-                        st.markdown("#### Prediction Result")
-                        st.markdown(f"""
-                        <div class="prediction-card">
-                            <div class="prediction-label">Predicted Digit</div>
-                            <div class="prediction-digit">{predicted_digit}</div>
-                            <div style="color: #94a3b8; margin-top: 0.5rem;">
-                                Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+    col1, col2 = st.columns([1, 1], gap="large")
 
-                        st.markdown("#### 📊 Top Predictions")
-                        top_indices = np.argsort(probabilities)[::-1][:5]
-                        for i, idx in enumerate(top_indices):
-                            prob = probabilities[idx] * 100
-                            if i == 0:
-                                bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
-                            elif i == 1:
-                                bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
-                            else:
-                                bar_color = "linear-gradient(90deg, #4a5568, #718096)"
-                            st.markdown(f"""
-                            <div class="confidence-bar-container">
-                                <div class="confidence-label">
-                                    <span>Digit {idx}</span>
-                                    <span>{prob:.1f}%</span>
-                                </div>
-                                <div class="confidence-bar-bg">
-                                    <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
-            else:
-                st.warning("Please draw a digit on the canvas first!")
+    with col1:
+        uploaded_file = st.file_uploader(
+            "Choose an image of a handwritten digit...",
+            type=["png", "jpg", "jpeg", "bmp"],
+        )
 
-    with tab2:
-        col3, col4 = st.columns([1, 1], gap="large")
+        if uploaded_file is not None:
+            st.image(uploaded_file, caption="Uploaded Image", width=280)
 
-        with col3:
-            st.markdown("#### Upload a digit image:")
-            uploaded_file = st.file_uploader(
-                "Choose an image...",
-                type=["png", "jpg", "jpeg", "bmp"],
-                label_visibility="collapsed"
-            )
+            if st.button("🔍 Predict Digit", key="predict_upload", use_container_width=True):
+                img_flat, processed_img = preprocess_uploaded_image(uploaded_file)
+                probabilities = model.predict_proba(img_flat)[0]
+                show_prediction(probabilities, col2)
 
-            if uploaded_file is not None:
-                st.image(uploaded_file, caption="Uploaded Image", width=280)
+    # --- Draw Section ---
+    st.markdown("---")
+    st.markdown("### ✏️ Or Draw a Digit")
+    st.info("💡 Draw a digit in the black box below using your mouse, then click **Predict**.")
 
-                if st.button("🔍 Predict", key="predict_upload", use_container_width=True):
-                    img_tensor, processed_img = preprocess_uploaded_image(uploaded_file)
-                    probabilities = predict_digit(model, img_tensor)
-                    predicted_digit = np.argmax(probabilities)
-                    confidence = probabilities[predicted_digit] * 100
+    # Use Streamlit's built-in canvas approach
+    col3, col4 = st.columns([1, 1], gap="large")
 
-                    with col4:
-                        st.markdown("#### Prediction Result")
-                        st.markdown(f"""
-                        <div class="prediction-card">
-                            <div class="prediction-label">Predicted Digit</div>
-                            <div class="prediction-digit">{predicted_digit}</div>
-                            <div style="color: #94a3b8; margin-top: 0.5rem;">
-                                Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+    with col3:
+        # Embedded HTML Canvas
+        html(get_canvas_html(), height=350)
 
-                        st.markdown("#### 📊 Top Predictions")
-                        top_indices = np.argsort(probabilities)[::-1][:5]
-                        for i, idx in enumerate(top_indices):
-                            prob = probabilities[idx] * 100
-                            if i == 0:
-                                bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
-                            elif i == 1:
-                                bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
-                            else:
-                                bar_color = "linear-gradient(90deg, #4a5568, #718096)"
-                            st.markdown(f"""
-                            <div class="confidence-bar-container">
-                                <div class="confidence-label">
-                                    <span>Digit {idx}</span>
-                                    <span>{prob:.1f}%</span>
-                                </div>
-                                <div class="confidence-bar-bg">
-                                    <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
-                                </div>
-                            </div>
-                            """, unsafe_allow_html=True)
+        st.markdown("")
+        st.markdown("**After drawing**, save the canvas as an image and upload it above, or use the sample images below.")
+
+    # --- Sample Test Images ---
+    st.markdown("---")
+    st.markdown("### 🧪 Quick Test with Sample Digits")
+    st.markdown("Click a button below to test the model with a sample from the MNIST dataset:")
+
+    sample_cols = st.columns(5)
+
+    # Generate sample digits from the trained model's data
+    @st.cache_data
+    def get_sample_digits():
+        mnist = fetch_openml('mnist_784', version=1, as_frame=False, parser='auto')
+        X, y = mnist.data, mnist.target.astype(int)
+        samples = {}
+        for digit in range(10):
+            idx = np.where(y == digit)[0][0]
+            samples[digit] = X[idx]
+        return samples
+
+    samples = get_sample_digits()
+
+    # First row: digits 0-4
+    for i, col in enumerate(sample_cols):
+        with col:
+            digit = i
+            img_array = samples[digit].reshape(28, 28)
+            img = Image.fromarray((img_array).astype(np.uint8), mode='L')
+            st.image(img, caption=f"Digit {digit}", width=100)
+            if st.button(f"Test {digit}", key=f"sample_{digit}", use_container_width=True):
+                img_flat = samples[digit].reshape(1, -1) / 255.0
+                probabilities = model.predict_proba(img_flat)[0]
+                st.session_state['last_prediction'] = (probabilities, digit)
+
+    # Second row: digits 5-9
+    sample_cols2 = st.columns(5)
+    for i, col in enumerate(sample_cols2):
+        with col:
+            digit = i + 5
+            img_array = samples[digit].reshape(28, 28)
+            img = Image.fromarray((img_array).astype(np.uint8), mode='L')
+            st.image(img, caption=f"Digit {digit}", width=100)
+            if st.button(f"Test {digit}", key=f"sample_{digit}", use_container_width=True):
+                img_flat = samples[digit].reshape(1, -1) / 255.0
+                probabilities = model.predict_proba(img_flat)[0]
+                st.session_state['last_prediction'] = (probabilities, digit)
+
+    # Show sample prediction result
+    if 'last_prediction' in st.session_state:
+        probabilities, true_digit = st.session_state['last_prediction']
+        predicted = np.argmax(probabilities)
+        confidence = probabilities[predicted] * 100
+
+        st.markdown("---")
+        st.markdown("### 🎯 Sample Prediction Result")
+
+        res_col1, res_col2 = st.columns([1, 2])
+        with res_col1:
+            st.markdown(f"""
+            <div class="prediction-card">
+                <div class="prediction-label">Predicted Digit</div>
+                <div class="prediction-digit">{predicted}</div>
+                <div style="color: #94a3b8; margin-top: 0.5rem;">
+                    Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
+                </div>
+                <div style="color: {'#34d399' if predicted == true_digit else '#ef4444'}; margin-top: 0.5rem; font-weight: 600;">
+                    {'✓ Correct!' if predicted == true_digit else f'✗ True digit: {true_digit}'}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        with res_col2:
+            st.markdown("#### 📊 Confidence Scores")
+            top_indices = np.argsort(probabilities)[::-1]
+            for i, idx in enumerate(top_indices):
+                prob = probabilities[idx] * 100
+                if prob < 0.5:
+                    continue
+                if i == 0:
+                    bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
+                elif i == 1:
+                    bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
+                else:
+                    bar_color = "linear-gradient(90deg, #4a5568, #718096)"
+                st.markdown(f"""
+                <div class="confidence-bar-container">
+                    <div class="confidence-label">
+                        <span>Digit {idx}</span>
+                        <span>{prob:.1f}%</span>
+                    </div>
+                    <div class="confidence-bar-bg">
+                        <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()
