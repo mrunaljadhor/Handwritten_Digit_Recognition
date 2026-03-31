@@ -1,60 +1,101 @@
 import numpy as np
 import streamlit as st
-import tensorflow as tf
-from tensorflow.keras import layers, models
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 from PIL import Image, ImageOps
 from streamlit_drawable_canvas import st_canvas
 
 # --- Configuration ---
 IMG_SIZE = 28
+DEVICE = torch.device('cpu')
+
+# --- CNN Model ---
+class DigitCNN(nn.Module):
+    def __init__(self):
+        super(DigitCNN, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(),
+        )
+        self.fc_layers = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 64),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(64, 10),
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.fc_layers(x)
+        return x
 
 @st.cache_resource
 def build_and_train_model():
     """Build, train, and return the CNN model on MNIST."""
     # Load MNIST
-    (x_train, y_train), (x_test, y_test) = tf.keras.datasets.mnist.load_data()
-    x_train, x_test = x_train / 255.0, x_test / 255.0
-    x_train = x_train.reshape(-1, 28, 28, 1)
-    x_test = x_test.reshape(-1, 28, 28, 1)
-
-    # Build CNN
-    model = models.Sequential([
-        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(28, 28, 1)),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, (3, 3), activation='relu'),
-        layers.MaxPooling2D((2, 2)),
-        layers.Conv2D(64, (3, 3), activation='relu'),
-        layers.Flatten(),
-        layers.Dense(64, activation='relu'),
-        layers.Dropout(0.5),
-        layers.Dense(10, activation='softmax')
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    model.compile(optimizer='adam',
-                  loss='sparse_categorical_crossentropy',
-                  metrics=['accuracy'])
+    train_dataset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
 
-    model.fit(x_train, y_train, epochs=3, validation_split=0.1, verbose=0)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
-    test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
+    # Build and train
+    model = DigitCNN().to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.CrossEntropyLoss()
 
+    model.train()
+    for epoch in range(3):
+        for data, target in train_loader:
+            data, target = data.to(DEVICE), target.to(DEVICE)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = criterion(output, target)
+            loss.backward()
+            optimizer.step()
+
+    # Evaluate
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(DEVICE), target.to(DEVICE)
+            output = model(data)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+
+    test_acc = correct / total
     return model, test_acc
 
 def preprocess_canvas_image(canvas_result):
     """Convert canvas drawing to model-ready input."""
     if canvas_result.image_data is not None:
-        # Get the image from canvas (RGBA)
         img = Image.fromarray(canvas_result.image_data.astype('uint8'), 'RGBA')
-        # Convert to grayscale
         img = img.convert('L')
-        # Resize to 28x28
         img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
-        # Invert (canvas has white drawing on black, MNIST is white on black)
         img = ImageOps.invert(img)
-        # Convert to array and normalize
-        img_array = np.array(img) / 255.0
-        img_array = img_array.reshape(1, 28, 28, 1)
-        return img_array, img
+        img_array = np.array(img).astype(np.float32) / 255.0
+        # Apply same normalization as training
+        img_array = (img_array - 0.1307) / 0.3081
+        img_tensor = torch.FloatTensor(img_array).unsqueeze(0).unsqueeze(0)
+        return img_tensor, img
     return None, None
 
 def preprocess_uploaded_image(uploaded_file):
@@ -63,9 +104,18 @@ def preprocess_uploaded_image(uploaded_file):
     img = img.convert('L')
     img = img.resize((IMG_SIZE, IMG_SIZE), Image.LANCZOS)
     img = ImageOps.invert(img)
-    img_array = np.array(img) / 255.0
-    img_array = img_array.reshape(1, 28, 28, 1)
-    return img_array, img
+    img_array = np.array(img).astype(np.float32) / 255.0
+    img_array = (img_array - 0.1307) / 0.3081
+    img_tensor = torch.FloatTensor(img_array).unsqueeze(0).unsqueeze(0)
+    return img_tensor, img
+
+def predict_digit(model, img_tensor):
+    """Run prediction and return probabilities."""
+    model.eval()
+    with torch.no_grad():
+        output = model(img_tensor.to(DEVICE))
+        probabilities = torch.softmax(output, dim=1).squeeze().numpy()
+    return probabilities
 
 def main():
     st.set_page_config(
@@ -198,7 +248,7 @@ def main():
         on the MNIST dataset to recognize digits 0-9.
 
         **Tech Stack:**
-        - 🧠 TensorFlow / Keras CNN
+        - 🧠 PyTorch CNN
         - 📊 MNIST Dataset (60K training images)
         - ✏️ Interactive Drawing Canvas
         - 📤 Image Upload Support
@@ -212,7 +262,7 @@ def main():
         - Upload a **clear, high-contrast** image for best accuracy
         """)
         st.divider()
-        st.caption("Built with ❤️ using Streamlit & TensorFlow")
+        st.caption("Built with ❤️ using Streamlit & PyTorch")
 
     # --- Header ---
     st.markdown("""
@@ -252,50 +302,49 @@ def main():
                 key="canvas",
             )
 
-            if st.button("🔍 Predict", key="predict_draw", use_container_width=True):
-                if canvas_result.image_data is not None:
-                    img_array, processed_img = preprocess_canvas_image(canvas_result)
-                    if img_array is not None:
-                        predictions = model.predict(img_array, verbose=0)
-                        predicted_digit = np.argmax(predictions)
-                        confidence = predictions[0][predicted_digit] * 100
+        if st.button("🔍 Predict", key="predict_draw", use_container_width=True):
+            if canvas_result.image_data is not None:
+                img_tensor, processed_img = preprocess_canvas_image(canvas_result)
+                if img_tensor is not None:
+                    probabilities = predict_digit(model, img_tensor)
+                    predicted_digit = np.argmax(probabilities)
+                    confidence = probabilities[predicted_digit] * 100
 
-                        with col2:
-                            st.markdown("#### Prediction Result")
+                    with col2:
+                        st.markdown("#### Prediction Result")
+                        st.markdown(f"""
+                        <div class="prediction-card">
+                            <div class="prediction-label">Predicted Digit</div>
+                            <div class="prediction-digit">{predicted_digit}</div>
+                            <div style="color: #94a3b8; margin-top: 0.5rem;">
+                                Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
+                            </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                        st.markdown("#### 📊 Top Predictions")
+                        top_indices = np.argsort(probabilities)[::-1][:5]
+                        for i, idx in enumerate(top_indices):
+                            prob = probabilities[idx] * 100
+                            if i == 0:
+                                bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
+                            elif i == 1:
+                                bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
+                            else:
+                                bar_color = "linear-gradient(90deg, #4a5568, #718096)"
                             st.markdown(f"""
-                            <div class="prediction-card">
-                                <div class="prediction-label">Predicted Digit</div>
-                                <div class="prediction-digit">{predicted_digit}</div>
-                                <div style="color: #94a3b8; margin-top: 0.5rem;">
-                                    Confidence: <strong style="color: #ffd200;">{confidence:.1f}%</strong>
+                            <div class="confidence-bar-container">
+                                <div class="confidence-label">
+                                    <span>Digit {idx}</span>
+                                    <span>{prob:.1f}%</span>
+                                </div>
+                                <div class="confidence-bar-bg">
+                                    <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
                                 </div>
                             </div>
                             """, unsafe_allow_html=True)
-
-                            # Show top 3 predictions
-                            st.markdown("#### 📊 Top Predictions")
-                            top_indices = np.argsort(predictions[0])[::-1][:5]
-                            for i, idx in enumerate(top_indices):
-                                prob = predictions[0][idx] * 100
-                                if i == 0:
-                                    bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
-                                elif i == 1:
-                                    bar_color = "linear-gradient(90deg, #667eea, #764ba2)"
-                                else:
-                                    bar_color = "linear-gradient(90deg, #4a5568, #718096)"
-                                st.markdown(f"""
-                                <div class="confidence-bar-container">
-                                    <div class="confidence-label">
-                                        <span>Digit {idx}</span>
-                                        <span>{prob:.1f}%</span>
-                                    </div>
-                                    <div class="confidence-bar-bg">
-                                        <div class="confidence-bar-fill" style="width: {prob}%; background: {bar_color};"></div>
-                                    </div>
-                                </div>
-                                """, unsafe_allow_html=True)
-                else:
-                    st.warning("Please draw a digit on the canvas first!")
+            else:
+                st.warning("Please draw a digit on the canvas first!")
 
     with tab2:
         col3, col4 = st.columns([1, 1], gap="large")
@@ -309,14 +358,13 @@ def main():
             )
 
             if uploaded_file is not None:
-                # Show uploaded image
                 st.image(uploaded_file, caption="Uploaded Image", width=280)
 
                 if st.button("🔍 Predict", key="predict_upload", use_container_width=True):
-                    img_array, processed_img = preprocess_uploaded_image(uploaded_file)
-                    predictions = model.predict(img_array, verbose=0)
-                    predicted_digit = np.argmax(predictions)
-                    confidence = predictions[0][predicted_digit] * 100
+                    img_tensor, processed_img = preprocess_uploaded_image(uploaded_file)
+                    probabilities = predict_digit(model, img_tensor)
+                    predicted_digit = np.argmax(probabilities)
+                    confidence = probabilities[predicted_digit] * 100
 
                     with col4:
                         st.markdown("#### Prediction Result")
@@ -330,11 +378,10 @@ def main():
                         </div>
                         """, unsafe_allow_html=True)
 
-                        # Show top 3 predictions
                         st.markdown("#### 📊 Top Predictions")
-                        top_indices = np.argsort(predictions[0])[::-1][:5]
+                        top_indices = np.argsort(probabilities)[::-1][:5]
                         for i, idx in enumerate(top_indices):
-                            prob = predictions[0][idx] * 100
+                            prob = probabilities[idx] * 100
                             if i == 0:
                                 bar_color = "linear-gradient(90deg, #f7971e, #ffd200)"
                             elif i == 1:
